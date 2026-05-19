@@ -11,8 +11,10 @@
 6. [Self-Hosted Runner Setup](#self-hosted-runner-setup)
 7. [Required Secrets](#required-secrets)
 8. [K6 Stress Testing](#k6-stress-testing)
-9. [Access Requirements](#access-requirements)
-10. [Troubleshooting](#troubleshooting)
+9. [K6 Baseline Health Check Results](#k6-baseline-health-check-results)
+10. [Access Requirements](#access-requirements)
+11. [Troubleshooting](#troubleshooting)
+12. [Ingress Configuration](#ingress-configuration)
 
 ---
 
@@ -593,6 +595,128 @@ kubectl apply -f bank-project/secret.yaml
 
 ---
 
+### CORS — Frontend showing "Unable to contact the server"
+
+**Cause:** Two problems found in the backend code:
+
+**Problem 1** — CORS was completely disabled in `SecurityConfig.java`:
+```java
+// ❌ Before
+http.csrf(csrf -> csrf.disable())
+    .cors(cors -> cors.disable())
+```
+
+**Problem 2** — Wrong allowed origin hardcoded in five files:
+```java
+// ❌ Before
+"https://bank.cloudwitches.online"
+```
+
+**Fix:** Removed `.cors(cors -> cors.disable())` to allow `WebConfig.java` to handle CORS. Updated allowed origin in all five files:
+```java
+// ✅ After
+"https://bank.rivetrecords.online"
+```
+
+Files updated: `OnlineBankingSystemApplication.java`, `WebConfig.java`, `BankAccountController.java`, `BankAccountTransactionController.java`, `BankController.java`
+
+---
+
+### Actuator Health Endpoint — 403 Access Denied
+
+**Cause:** Spring Security was blocking `/actuator/health` — not listed in `permitAll()`.
+
+**Fix:** Added `/actuator/health` to `permitAll()` in `SecurityConfig.java`:
+```java
+// ❌ Before
+.requestMatchers("/api/user/login", "/api/user/admin/register").permitAll()
+
+// ✅ After
+.requestMatchers("/api/user/login", "/api/user/admin/register", "/actuator/health").permitAll()
+```
+
+**Verification:** After fix, hitting `https://bankapi.rivetrecords.online/actuator/health` returned:
+```json
+{
+  "status": "UP",
+  "components": {
+    "db": { "status": "UP" },
+    "diskSpace": { "status": "UP" },
+    "livenessState": { "status": "UP" },
+    "readinessState": { "status": "UP" }
+  }
+}
+```
+
+---
+
+### ConfigMap Mismatch — 503 Service Unavailable
+
+Backend pod was starting successfully but returning 503. Environment variables were not being injected into the pod.
+
+**Three problems found:**
+
+**Problem 1** — ConfigMap name mismatch:
+```yaml
+# ❌ configmap.yaml had:
+name: bank-backend-config
+
+# backendapi.yaml expected:
+name: bank-config
+```
+
+**Problem 2** — Wrong variable name:
+```yaml
+# ❌ configmap.yaml had:
+DB_URL: production-mysql-db.cax8262mgyle.us-east-1.rds.amazonaws.com
+
+# application.properties expected:
+DB_HOST: ...
+```
+
+**Problem 3** — `DB_URL` incomplete — missing port and database name.
+
+**Fix:** Updated `configmap.yaml`:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bank-config
+data:
+  DB_HOST: "production-mysql-db.cax8262mgyle.us-east-1.rds.amazonaws.com"
+  DB_PORT: "3306"
+  DB_NAME: "production_db"
+```
+
+Updated `application.properties`:
+```properties
+# ❌ Before
+spring.datasource.url=jdbc:mysql://${DB_URL}
+
+# ✅ After
+spring.datasource.url=jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}
+```
+
+---
+
+### K6 — 100% failure after app confirmed healthy
+
+**Cause:** `BACKEND_URL` was stored under **Repository Variables** but the pipeline referenced it as a secret:
+```yaml
+# Pipeline was looking here:
+BACKEND_URL: ${{ secrets.BACKEND_URL }}
+
+# But the value was stored here:
+Repository Variables → BACKEND_URL
+```
+
+**Fix:** Moved `BACKEND_URL` from Repository Variables to **Repository Secrets**:
+- GitHub → Settings → Secrets and Variables → Actions → New repository secret
+- Name: `BACKEND_URL`
+- Value: `https://bankapi.rivetrecords.online`
+
+---
+
 ### K6 — TLS certificate mismatch
 Encountered: `x509: certificate is valid for ingress.local, not bankapi.rivetrecords.online`
 
@@ -627,6 +751,25 @@ Check that `GITHUB_PAT` in `.env` has not expired. The `.env` file must never be
 ### SonarQube scan failing
 - Confirm `SONAR_TOKEN` and `SONAR_HOST_URL` are correctly set
 - Check that the SonarQube server is reachable from the runner
+
+---
+
+## K6 Baseline Health Check Results
+
+First successful run after backend pod deployment — May 2026.
+
+| Metric | Result | Status |
+|---|---|---|
+| `status is 200` | 100% — 2034 checks passed | ✅ |
+| `app is UP` | 100% | ✅ |
+| `http_req_failed` | 0.00% | ✅ |
+| `http_req_duration avg` | 6.33ms | ✅ Well under 500ms threshold |
+| `http_req_duration p(95)` | 8.37ms | ✅ Well under 500ms threshold |
+| `http_reqs` | 1017 at 7.25 req/s | ✅ |
+| `data_received` | 780 kB | ✅ Real data returning |
+| Virtual users | 10 max | ✅ |
+
+All thresholds passed. Backend confirmed healthy and performant.
 
 ---
 
